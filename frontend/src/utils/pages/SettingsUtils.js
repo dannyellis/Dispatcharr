@@ -57,15 +57,7 @@ const GROUP_CONFIG = {
       comskip_enabled: { type: 'bool', default: false },
       comskip_custom_path: { type: 'raw', default: '' },
       comskip_mode: { type: 'string', default: 'cut' },
-      comskip_hw_accel: {
-        type: 'string',
-        default: 'none',
-        // Legacy "qsv" never worked with the bundled binary; map to hwassist.
-        parse: (value) => {
-          const hwAccel = value || 'none';
-          return hwAccel === 'qsv' ? 'hwassist' : hwAccel;
-        },
-      },
+      comskip_hw_accel: { type: 'string', default: 'none' },
       pre_offset_minutes: { type: 'int', default: 0 },
       post_offset_minutes: { type: 'int', default: 0 },
       series_rules: { type: 'array', default: [] },

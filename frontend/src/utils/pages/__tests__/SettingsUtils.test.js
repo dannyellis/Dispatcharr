@@ -88,7 +88,7 @@ describe('SettingsUtils', () => {
       expect(result).not.toHaveProperty('comskip_enabled');
     });
 
-    it('parses dvr output_profile_id as a string and maps qsv to hwassist', () => {
+    it('parses dvr output_profile_id as a string and preserves qsv', () => {
       const settings = {
         dvr_settings: {
           value: {
@@ -105,7 +105,7 @@ describe('SettingsUtils', () => {
       const result = SettingsUtils.parseGroupSettings(settings, 'dvr_settings');
 
       expect(result.output_profile_id).toBe('6');
-      expect(result.comskip_hw_accel).toBe('hwassist');
+      expect(result.comskip_hw_accel).toBe('qsv');
       expect(result.comskip_enabled).toBe(true);
       expect(result.pre_offset_minutes).toBe(2);
       expect(result.post_offset_minutes).toBe(3);

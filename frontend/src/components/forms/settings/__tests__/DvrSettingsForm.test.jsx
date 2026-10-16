@@ -255,6 +255,21 @@ describe('DvrSettingsForm', () => {
       });
     });
 
+    it('offers Intel QSV alongside the existing decoder modes', async () => {
+      render(<DvrSettingsForm active={true} />);
+      await waitFor(() => {
+        const select = screen.getByRole('combobox', {
+          name: 'Hardware acceleration',
+        });
+        expect(Array.from(select.options, (option) => option.value)).toEqual([
+          'none',
+          'cuvid',
+          'hwassist',
+          'qsv',
+        ]);
+      });
+    });
+
     it('renders the file input for comskip.ini upload', async () => {
       render(<DvrSettingsForm active={true} />);
       await waitFor(() => {

@@ -3334,20 +3334,27 @@ def recover_recordings_on_startup():
         logger.error(f"Error during DVR recovery: {e}")
         return f"Error: {e}"
 
-# Setting value -> CLI flag for the bundled Comskip donator build.
-# "qsv" is a legacy alias; that build has no --qsv option.
+# Decoder flags supported by the bundled Comskip build.
 _COMSKIP_HW_ACCEL_FLAGS = {
-    "cuvid": "--cuvid",
-    "hwassist": "--hwassist",
-    "qsv": "--hwassist",
+    "cuvid": ("--cuvid",),
+    "hwassist": ("--hwassist",),
+    "qsv": ("--qsv", "--hwassist"),
 }
 
 
-def _comskip_hw_accel_flag(hw_accel: str) -> str | None:
-    """Return the Comskip CLI flag for a DVR hardware-accel setting, or None."""
-    if not hw_accel or hw_accel == "none":
-        return None
-    return _COMSKIP_HW_ACCEL_FLAGS.get(hw_accel)
+def _comskip_hw_accel_flags(hw_accel: str | None) -> tuple[str, ...]:
+    """Return decoder arguments, or none for software/unknown modes."""
+    return _COMSKIP_HW_ACCEL_FLAGS.get(hw_accel, ())
+
+
+def _comskip_subprocess_env(hw_accel: str) -> dict[str, str]:
+    """Use Comskip's system VA-API driver without changing FFmpeg's environment."""
+    env = os.environ.copy()
+    if hw_accel == "qsv":
+        env["LIBVA_DRIVER_NAME"] = env.get("COMSKIP_LIBVA_DRIVER_NAME") or "iHD"
+        if driver_path := env.get("COMSKIP_LIBVA_DRIVERS_PATH"):
+            env["LIBVA_DRIVERS_PATH"] = driver_path
+    return env
 
 
 @shared_task
@@ -3423,10 +3430,11 @@ def comskip_process_recording(recording_id: int):
 
     try:
         comskip_mode = CoreSettings.get_dvr_comskip_mode()
-        hw_flag = _comskip_hw_accel_flag(CoreSettings.get_dvr_comskip_hw_accel())
-        cmd = [comskip_bin, "--threads=1", "--output", os.path.dirname(file_path)]
-        if hw_flag:
-            cmd.insert(1, hw_flag)
+        hw_accel = CoreSettings.get_dvr_comskip_hw_accel()
+        cmd = [
+            comskip_bin, *_comskip_hw_accel_flags(hw_accel),
+            "--threads=1", "--output", os.path.dirname(file_path),
+        ]
         # Prefer user-specified INI, fall back to known defaults
         ini_candidates = []
         try:
@@ -3445,6 +3453,7 @@ def comskip_process_recording(recording_id: int):
         cmd.append(file_path)
         result = subprocess.run(
             cmd,
+            env=_comskip_subprocess_env(hw_accel),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

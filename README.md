@@ -104,6 +104,20 @@ docker run -d \
 
 > Customize ports and volumes to fit your setup.
 
+### Intel Quick Sync for Comskip
+
+On Linux hosts with a supported Intel GPU, pass `--device /dev/dri:/dev/dri` to
+Docker (or add `/dev/dri` as a device in Unraid), then select **Intel Quick Sync
+(QSV)** under **Settings → DVR Settings → Hardware acceleration**. The container
+user must have permission to access the GPU's render device.
+
+The amd64 image includes the system Intel VA-API driver required by Comskip.
+Its driver settings apply only to Comskip; FFmpeg retains its own driver stack.
+For other driver installations, set `COMSKIP_LIBVA_DRIVER_NAME` (default `iHD`)
+and `COMSKIP_LIBVA_DRIVERS_PATH` (default `/usr/lib/x86_64-linux-gnu/dri` in the
+Docker image). Native installations retain their existing driver search path
+unless `COMSKIP_LIBVA_DRIVERS_PATH` is set.
+
 First-time web setup is limited to local/private networks by default. If you are installing on a VPS or otherwise reaching the UI from a public IP, either create the admin with `docker exec <container> python manage.py createsuperuser`, or set `DISPATCHARR_SETUP_ALLOWED_IP` to your client IP (see comments in the compose files). The setup page also shows the IP Dispatcharr sees.
 
 Behind a reverse proxy, set `DISPATCHARR_TRUSTED_PROXIES` to your proxy's IP or CIDR so Network Access, Stats, and rate limits see real client IPs (defaults trust private/loopback peers; use `none` to ignore forwarded headers).

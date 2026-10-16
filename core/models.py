@@ -797,10 +797,7 @@ class CoreSettings(models.Model):
     @classmethod
     def get_dvr_comskip_hw_accel(cls):
         hw = cls.get_dvr_settings().get("comskip_hw_accel", "none")
-        # Legacy "qsv" never worked with the bundled binary; treat as hwassist.
-        if hw == "qsv":
-            return "hwassist"
-        return hw if hw in ("none", "cuvid", "hwassist") else "none"
+        return hw if hw in ("none", "cuvid", "hwassist", "qsv") else "none"
 
     @classmethod
     def get_dvr_comskip_custom_path(cls):

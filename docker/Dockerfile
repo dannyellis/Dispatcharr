@@ -24,6 +24,27 @@ ARG BASE_TAG
 FROM ghcr.io/${REPO_OWNER}/${REPO_NAME}:${BASE_TAG} AS final
 ENV VIRTUAL_ENV=/dispatcharrpy
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+# Comskip links distro libav/libva; FFmpeg uses the separate /usr/local stack.
+ENV COMSKIP_LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
+
+# Keep QSV runtime requirements with the application: dev builds can use a
+# published release base that predates this driver installation.
+RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+    apt-get update \
+    && apt-get install --no-install-recommends -y intel-media-va-driver-non-free \
+    && test -r "$COMSKIP_LIBVA_DRIVERS_PATH/iHD_drv_video.so" \
+    && rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# --help can exit 2. Check the advertised options without requiring a GPU.
+RUN set -eu; \
+    status=0; \
+    comskip --help > /tmp/comskip-help.txt 2>&1 || status=$?; \
+    test "$status" -eq 0 || test "$status" -eq 2; \
+    grep -q -- '--qsv' /tmp/comskip-help.txt; \
+    grep -q -- '--hwassist' /tmp/comskip-help.txt; \
+    rm /tmp/comskip-help.txt
+
 WORKDIR /app
 
 # Copy application code
