@@ -1640,6 +1640,9 @@ def _dvr_build_ffmpeg_cmd(
 # Shared ceiling for HLS finalize
 _DVR_HLS_REMUX_TIMEOUT_SECONDS = 30 * 60
 
+# Corrupt segments to drop before giving up on salvaging a recording.
+_DVR_REMUX_MAX_SKIPPED_SEGMENTS = 3
+
 
 def _dvr_recording_end_payload(
     cp, final_path, remux_success, start_time=None, end_time=None,
@@ -1822,6 +1825,39 @@ def _dvr_output_nonempty(path):
     return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
 
 
+# FFmpeg always prints this preamble; it is never the reason a run failed.
+_DVR_FFMPEG_BANNER_PREFIXES = (
+    "ffmpeg version",
+    "built with",
+    "configuration:",
+    "libavutil",
+    "libavcodec",
+    "libavformat",
+    "libavdevice",
+    "libavfilter",
+    "libswscale",
+    "libswresample",
+)
+
+
+def _dvr_ffmpeg_error_tail(stderr, max_chars=1500):
+    """Return the meaningful end of FFmpeg stderr for a log line.
+
+    FFmpeg writes its version banner first and the actual errors last, so
+    slicing from the front (``stderr[:300]``) logged nothing but the banner.
+    Drop the banner lines and keep the tail, where the failure is explained.
+    """
+    if not stderr:
+        return "<no stderr>"
+    lines = [line.rstrip() for line in stderr.splitlines() if line.strip()]
+    body = [
+        line for line in lines
+        if not line.strip().startswith(_DVR_FFMPEG_BANNER_PREFIXES)
+    ]
+    text = "\n".join(body or lines)
+    return text[-max_chars:]
+
+
 def _dvr_run_ffmpeg_with_budget(cmd, log_label, step_label, deadline):
     """Run ffmpeg under a shared remux deadline. Returns a CompletedProcess or None."""
     remaining = deadline - time.monotonic()
@@ -1847,26 +1883,64 @@ def _dvr_run_ffmpeg_with_budget(cmd, log_label, step_label, deadline):
         return None
 
 
-def _dvr_remux_hls_to_mkv(m3u8_path, output_path, log_label, recording_id):
-    """Remux ``index.m3u8`` to MKV. Tries direct remux, then MP4 intermediate.
+def _dvr_hls_last_opened_segment(stderr):
+    """Return the basename of the last HLS segment FFmpeg reported opening.
 
-    Returns ``(success, via_mp4_fallback)``.
+    The HLS demuxer logs ``Opening '<uri>' for reading`` for every segment, so
+    the last one is the segment being read when the run died. Used to drop a
+    corrupt segment and retry (FFmpeg aborts instead of skipping it once the
+    muxer rejects a packet).
     """
-    if not m3u8_path or not os.path.exists(m3u8_path):
-        logger.warning(f"{log_label}: no HLS playlist to remux")
-        return False, False
-    if not _dvr_ensure_hls_endlist(m3u8_path):
-        logger.error(
-            f"{log_label}: playlist is missing EXT-X-ENDLIST and could not be updated"
-        )
-        return False, False
+    if not stderr:
+        return None
+    matches = re.findall(r"Opening '([^']+)' for reading", stderr)
+    return os.path.basename(matches[-1]) if matches else None
 
-    out_dir = os.path.dirname(output_path)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
 
-    deadline = time.monotonic() + _DVR_HLS_REMUX_TIMEOUT_SECONDS
+def _dvr_hls_playlist_without_segment(m3u8_path, segment_name, dest_path):
+    """Write a copy of ``m3u8_path`` with one segment and its tags removed.
 
+    Returns True when the segment was present and the playlist was written.
+    """
+    try:
+        with open(m3u8_path) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return False
+
+    out = []
+    dropped = False
+    for line in lines:
+        text = line.strip()
+        if text and not text.startswith("#"):
+            uri = os.path.basename(text.split("?", 1)[0])
+            if uri == segment_name:
+                if out and out[-1].strip().startswith("#EXTINF"):
+                    out.pop()
+                dropped = True
+                continue
+        out.append(line)
+
+    if not dropped:
+        return False
+    try:
+        tmp = f"{dest_path}.tmp"
+        with open(tmp, "w") as fh:
+            fh.write("\n".join(out) + "\n")
+        os.replace(tmp, dest_path)
+    except OSError:
+        return False
+    return True
+
+
+def _dvr_remux_playlist_once(
+    m3u8_path, output_path, log_label, recording_id, deadline
+):
+    """One direct-then-MP4 passthrough attempt.
+
+    Returns ``(success, via_mp4, stderr_text)``; ``stderr_text`` combines the
+    attempts so the caller can identify the segment that killed the run.
+    """
     playlist_result = _dvr_run_ffmpeg_with_budget(
         _dvr_build_hls_playlist_remux_cmd(m3u8_path, output_path),
         log_label,
@@ -1878,14 +1952,14 @@ def _dvr_remux_hls_to_mkv(m3u8_path, output_path, log_label, recording_id):
         and playlist_result.returncode == 0
         and _dvr_output_nonempty(output_path)
     ):
-        return True, False
+        return True, False, ""
 
+    stderr_text = getattr(playlist_result, "stderr", None) or ""
     _rc = getattr(playlist_result, "returncode", "timeout")
-    _stderr = (getattr(playlist_result, "stderr", None) or "")[:300]
     logger.warning(
         f"{log_label}: HLS\u2192MKV playlist remux failed "
         f"(rc={_rc}); attempting MP4-intermediate "
-        f"fallback. stderr: {_stderr}"
+        f"fallback. stderr: {_dvr_ffmpeg_error_tail(stderr_text)}"
     )
     _dvr_remove_empty_or_partial_output(output_path)
 
@@ -1900,11 +1974,14 @@ def _dvr_remux_hls_to_mkv(m3u8_path, output_path, log_label, recording_id):
         pass
 
     try:
+        # No explicit ``-bsf:a aac_adtstoasc``: the MP4 muxer adds it on its
+        # own for AAC streams, and forcing it makes every non-AAC source
+        # (AC-3, E-AC-3, MP2 — common on IPTV) fail with EINVAL (rc=234)
+        # before a single packet is copied.
         mp4_result = _dvr_run_ffmpeg_with_budget(
             _dvr_build_hls_playlist_remux_cmd(
                 m3u8_path,
                 intermediate_mp4,
-                extra_args=["-bsf:a", "aac_adtstoasc"],
             ),
             log_label,
             "HLS\u2192MP4 remux fallback",
@@ -1916,12 +1993,12 @@ def _dvr_remux_hls_to_mkv(m3u8_path, output_path, log_label, recording_id):
             and _dvr_output_nonempty(intermediate_mp4)
         ):
             _rc = getattr(mp4_result, "returncode", "timeout")
-            _stderr = (getattr(mp4_result, "stderr", None) or "")[:300]
+            _mp4_stderr = getattr(mp4_result, "stderr", None) or ""
             logger.error(
                 f"{log_label}: HLS\u2192MP4 remux fallback failed "
-                f"(rc={_rc}). stderr: {_stderr}"
+                f"(rc={_rc}). stderr: {_dvr_ffmpeg_error_tail(_mp4_stderr)}"
             )
-            return False, False
+            return False, False, f"{stderr_text}\n{_mp4_stderr}"
 
         mkv_result = _dvr_run_ffmpeg_with_budget(
             [
@@ -1942,22 +2019,89 @@ def _dvr_remux_hls_to_mkv(m3u8_path, output_path, log_label, recording_id):
             and mkv_result.returncode == 0
             and _dvr_output_nonempty(output_path)
         ):
-            return True, True
+            return True, True, ""
 
         _rc = getattr(mkv_result, "returncode", "timeout")
-        _stderr = (getattr(mkv_result, "stderr", None) or "")[:300]
+        _mkv_stderr = getattr(mkv_result, "stderr", None) or ""
         logger.error(
             f"{log_label}: MP4\u2192MKV remux step failed "
-            f"(rc={_rc}). stderr: {_stderr}"
+            f"(rc={_rc}). stderr: {_dvr_ffmpeg_error_tail(_mkv_stderr)}"
         )
         _dvr_remove_empty_or_partial_output(output_path)
-        return False, False
+        return False, False, f"{stderr_text}\n{_mkv_stderr}"
     finally:
         try:
             if os.path.exists(intermediate_mp4):
                 os.remove(intermediate_mp4)
         except OSError:
             pass
+
+
+def _dvr_remux_hls_to_mkv(m3u8_path, output_path, log_label, recording_id):
+    """Remux ``index.m3u8`` to MKV. Tries direct remux, then MP4 intermediate.
+
+    A single corrupt source segment (bad ADTS header, truncated last segment)
+    aborts the whole copy because FFmpeg cannot skip it once the muxer rejects
+    a packet. When that happens, drop the segment FFmpeg choked on and retry,
+    so the rest of the recording is still salvaged.
+
+    Returns ``(success, via_mp4_fallback)``.
+    """
+    if not m3u8_path or not os.path.exists(m3u8_path):
+        logger.warning(f"{log_label}: no HLS playlist to remux")
+        return False, False
+    if not _dvr_ensure_hls_endlist(m3u8_path):
+        logger.error(
+            f"{log_label}: playlist is missing EXT-X-ENDLIST and could not be updated"
+        )
+        return False, False
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    hls_dir = os.path.dirname(m3u8_path)
+    recovery_playlist = os.path.join(
+        hls_dir, f".dvr_{recording_id}_recovery.m3u8"
+    )
+    deadline = time.monotonic() + _DVR_HLS_REMUX_TIMEOUT_SECONDS
+    current_playlist = m3u8_path
+    skipped = []
+
+    while True:
+        success, via_mp4, stderr_text = _dvr_remux_playlist_once(
+            current_playlist, output_path, log_label, recording_id, deadline
+        )
+        if success:
+            return True, via_mp4
+
+        # Only a data-corruption failure can be pinned on one segment. EINVAL
+        # (container/bitstream-filter mismatch) or a timeout would just burn
+        # another pass without ever succeeding.
+        if "Invalid data found" not in stderr_text:
+            break
+
+        bad_segment = _dvr_hls_last_opened_segment(stderr_text)
+        if (
+            not bad_segment
+            or bad_segment in skipped
+            or len(skipped) >= _DVR_REMUX_MAX_SKIPPED_SEGMENTS
+        ):
+            break
+        if not _dvr_hls_playlist_without_segment(
+            current_playlist, bad_segment, recovery_playlist
+        ):
+            break
+
+        skipped.append(bad_segment)
+        current_playlist = recovery_playlist
+        logger.warning(
+            f"{log_label}: dropping unreadable HLS segment {bad_segment} "
+            f"and retrying remux "
+            f"({len(skipped)}/{_DVR_REMUX_MAX_SKIPPED_SEGMENTS})"
+        )
+
+    return False, False
 
 
 def _dvr_drain_ffmpeg_stderr(proc, rec_id, tail):
